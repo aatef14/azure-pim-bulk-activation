@@ -1,0 +1,4 @@
+portal.log
+*.csv
+Activate-PimRoles.ps1
+activate-pim-roles.ps1
