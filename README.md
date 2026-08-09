@@ -26,8 +26,14 @@ instead of clicking "Activate" one row at a time in the Azure Portal.
 
 ## How to run
 
-1. Clone this repo (or download it as a ZIP and extract it).
-2. Open PowerShell in the folder.
+1. Clone this repo (or download it as a ZIP and extract it):
+   ```bash
+   git clone https://github.com/aatef14/azure-pim-bulk-activation.git
+   ```
+2. Open PowerShell in the folder:
+   ```powershell
+   cd azure-pim-bulk-activation
+   ```
 3. Run:
    ```powershell
    .\Start-PimPortal.ps1
