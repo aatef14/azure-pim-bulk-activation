@@ -82,6 +82,38 @@ Running on a different port (if 8787 is already in use):
 - Stop the app any time with `Ctrl+C` in the PowerShell window, or just
   close the window.
 
+## Optional: using it via Claude Code (MCP)
+
+If your team uses Claude Code, `pim_mcp_server.py` wraps this app as an MCP
+server so you can just ask Claude to activate your roles instead of clicking
+through the browser.
+
+Requirements: Python 3.10+, with `mcp` and `requests` installed
+(`pip install mcp requests`).
+
+1. Add a `.mcp.json` in the project you're working from (already included in
+   this repo if you're running Claude Code from here):
+   ```json
+   {
+     "mcpServers": {
+       "bulk-pim-activator": {
+         "command": "python",
+         "args": ["pim_mcp_server.py"],
+         "cwd": "."
+       }
+     }
+   }
+   ```
+2. Restart Claude Code and approve the `bulk-pim-activator` server when
+   prompted.
+3. Ask Claude something like "activate my PIM roles" — it will sign you in,
+   list your tenants/subscriptions, ask which to target, and activate
+   whichever roles you pick.
+
+The MCP server just calls the same local web app under the hood
+(`Start-PimPortal.ps1`, auto-started if not already running), so the same
+security notes above apply.
+
 ## Sharing this with your team
 
 Anyone with access to this repo can clone it and run

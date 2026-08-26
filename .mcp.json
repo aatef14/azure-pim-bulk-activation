@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "bulk-pim-activator": {
+      "command": "python",
+      "args": ["pim_mcp_server.py"],
+      "cwd": "."
+    }
+  }
+}
