@@ -14,6 +14,12 @@ instead of clicking "Activate" one row at a time in the Azure Portal.
   resource groups / resources).
 - Select some or all of them and **activate or deactivate in bulk**, with
   live per-row progress.
+- Active roles expiring within the hour are flagged with an "Expires in Xm"
+  badge (red under 15 minutes) so you're not caught out mid-work.
+- Save a tenant + subscription + optional resource-name filter as a
+  **preset** (e.g. "KFAS API-Portal") so you don't have to re-pick scope
+  every time — then run it with one click, or schedule it to run
+  **automatically every morning**, unattended.
 - Runs entirely on your own machine as a local web server — nothing is
   hosted centrally, and no data leaves your laptop besides normal calls to
   Microsoft's own sign-in and Azure Resource Manager endpoints.
@@ -51,6 +57,33 @@ Running on a different port (if 8787 is already in use):
 ```powershell
 .\Start-PimPortal.ps1 -Port 9000
 ```
+
+## Presets and scheduled activation
+
+1. Pick a Directory and Subscription as usual, optionally set a **Filter**
+   (a substring matched against resource group names — e.g. `api-portal`),
+   give it a **Preset name**, and click **Save current scope as preset**.
+2. Use **Run now** on a saved preset any time to activate everything it
+   matches without re-picking scope.
+3. To run it automatically every day with no browser/UI at all:
+   - Click **Save sign-in for scheduling** once (encrypts your refresh
+     token to disk with Windows DPAPI — decryptable only by your Windows
+     account on this machine, never in plain text).
+   - Pick a time next to the preset and click **Schedule daily** — this
+     registers a Windows Scheduled Task (visible in Task Scheduler as
+     `BulkPimActivator-<preset name>`) that runs the preset headlessly.
+   - Results are logged to `auto-activate.log` next to the script.
+
+You can also do this from the command line instead of the UI:
+```powershell
+# Register the schedule directly
+.\Start-PimPortal.ps1 -InstallSchedule "KFAS API-Portal" -ScheduleTime "07:30"
+
+# Run a preset headlessly right now (what the scheduled task actually calls)
+.\Start-PimPortal.ps1 -RunPreset "KFAS API-Portal"
+```
+`presets.json`, `session.dat`, and `auto-activate.log` are all local,
+per-machine files (git-ignored) — they're never pushed to the repo.
 
 ## How sign-in works (security notes)
 
@@ -108,7 +141,10 @@ Requirements: Python 3.10+, with `mcp` and `requests` installed
    prompted.
 3. Ask Claude something like "activate my PIM roles" — it will sign you in,
    list your tenants/subscriptions, ask which to target, and activate
-   whichever roles you pick.
+   whichever roles you pick. It can also save/run/schedule presets
+   (`list_presets`, `save_preset`, `run_preset`, `schedule_preset`,
+   `save_session_for_scheduling`) — e.g. "activate my KFAS API-Portal
+   preset" or "schedule my KFAS API-Portal preset for 7:30am daily".
 
 The MCP server just calls the same local web app under the hood
 (`Start-PimPortal.ps1`, auto-started if not already running), so the same

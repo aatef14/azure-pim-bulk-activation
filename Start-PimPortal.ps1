@@ -23,17 +23,44 @@
     token refresh several Az.Resources cmdlets need internally, failing with
     "the access token is invalid" even for a freshly-minted, valid token.
 
+    Presets (a saved tenant + subscription + resource-name filter, e.g. "KFAS
+    API-Portal") let you skip re-picking scope every time, and can be run
+    unattended on a schedule: "Save sign-in for scheduling" encrypts your
+    refresh token to disk (Windows DPAPI - only your Windows account on this
+    machine can decrypt it), then -RunPreset uses it headlessly with no
+    browser/UI at all, which is what a scheduled task invokes.
+
 .PARAMETER Port
     Local port to serve on. Default 8787.
+
+.PARAMETER RunPreset
+    Headless mode: activate the named saved preset using the saved session
+    (see "Save sign-in for scheduling" in the app) and exit. No web server is
+    started. Intended for Windows Task Scheduler. Logs to auto-activate.log.
+
+.PARAMETER InstallSchedule
+    Name of a saved preset to schedule. Registers a Windows scheduled task
+    (via schtasks) that runs `-RunPreset <name>` daily at -ScheduleTime, then
+    exits. No web server is started.
+
+.PARAMETER ScheduleTime
+    Time of day (HH:mm, 24h) for -InstallSchedule. Default 08:00.
 
 .EXAMPLE
     .\Start-PimPortal.ps1
     # then browse to http://localhost:8787/
+
+.EXAMPLE
+    .\Start-PimPortal.ps1 -InstallSchedule "KFAS API-Portal" -ScheduleTime "07:30"
+    # registers a daily 7:30am task that silently activates that preset
 #>
 
 [CmdletBinding()]
 param(
-    [int] $Port = 8787
+    [int]    $Port = 8787,
+    [string] $RunPreset,
+    [string] $InstallSchedule,
+    [string] $ScheduleTime = "08:00"
 )
 
 Add-Type -AssemblyName System.Web
@@ -50,6 +77,20 @@ $script:AccountLabel = $null
 $script:CurrentTenantId = $null
 $script:MyPrincipalId = $null
 $script:RefreshToken = $null
+
+$script:ScriptPath    = $MyInvocation.MyCommand.Path
+$script:ScriptDir     = Split-Path -Parent $script:ScriptPath
+$script:PresetsPath   = Join-Path $script:ScriptDir "presets.json"
+$script:SessionPath   = Join-Path $script:ScriptDir "session.dat"
+$script:AutoLogPath   = Join-Path $script:ScriptDir "auto-activate.log"
+
+function Get-JwtClaims {
+    param([string]$Jwt)
+    $payload = $Jwt.Split('.')[1]
+    $payload += "=" * ((4 - $payload.Length % 4) % 4)
+    $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload.Replace('-','+').Replace('_','/')))
+    return $json | ConvertFrom-Json
+}
 
 function Get-ArmToken {
     # Redeem our stored refresh_token (from the offline_access scope) for a
@@ -91,14 +132,6 @@ function Get-ArmErrorMessage {
     return $ErrorRecord.Exception.Message
 }
 
-function Get-JwtClaims {
-    param([string]$Jwt)
-    $payload = $Jwt.Split('.')[1]
-    $payload += "=" * ((4 - $payload.Length % 4) % 4)
-    $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload.Replace('-','+').Replace('_','/')))
-    return $json | ConvertFrom-Json
-}
-
 function Write-JsonResponse {
     param($Context, $Object, [int]$StatusCode = 200)
     $json = $Object | ConvertTo-Json -Depth 6
@@ -126,6 +159,150 @@ function Get-RequestBody {
     $reader.Close()
     if ([string]::IsNullOrWhiteSpace($body)) { return $null }
     return $body | ConvertFrom-Json
+}
+
+# ---------- Presets ----------
+function Get-Presets {
+    if (-not (Test-Path $script:PresetsPath)) { return @() }
+    $raw = Get-Content $script:PresetsPath -Raw
+    if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+    return @($raw | ConvertFrom-Json)
+}
+
+function Save-Presets {
+    param($Presets)
+    @($Presets) | ConvertTo-Json -Depth 5 | Set-Content -Path $script:PresetsPath -Encoding UTF8
+}
+
+# ---------- Session persistence (Windows DPAPI - decryptable only by this
+# Windows account on this machine, which is what lets a scheduled task run
+# with no browser/UI while still not storing the token in plain text) ----------
+function Save-Session {
+    param([string]$RefreshTokenValue)
+    $secure = ConvertTo-SecureString -String $RefreshTokenValue -AsPlainText -Force
+    $encrypted = ConvertFrom-SecureString -SecureString $secure
+    Set-Content -Path $script:SessionPath -Value $encrypted -Encoding UTF8 -NoNewline
+}
+
+function Load-Session {
+    if (-not (Test-Path $script:SessionPath)) { return $null }
+    try {
+        $encrypted = (Get-Content $script:SessionPath -Raw).Trim()
+        $secure = ConvertTo-SecureString -String $encrypted
+        return [System.Net.NetworkCredential]::new('', $secure).Password
+    } catch {
+        return $null
+    }
+}
+
+# ---------- Shared preset-activation logic (used by both the web app's
+# "Run now" button and headless -RunPreset scheduled runs) ----------
+function Invoke-PresetActivation {
+    param($Preset, [string]$Justification = "Scheduled automatic activation", [int]$DurationHours = 8)
+
+    Get-ArmToken -TenantId $Preset.tenantId | Out-Null
+
+    $eligibleResp = Invoke-Arm -Path "/providers/Microsoft.Authorization/roleEligibilityScheduleInstances?api-version=$script:ArmApiVersion&`$filter=asTarget()"
+    $eligible = $eligibleResp.value | Where-Object {
+        $_.properties.status -eq "Provisioned" -and $_.properties.scope -like "/subscriptions/$($Preset.subscriptionId)*"
+    }
+    if ($Preset.filter) {
+        $eligible = $eligible | Where-Object { ($_.properties.scope -split "/")[-1] -like "*$($Preset.filter)*" }
+    }
+
+    $activeResp = Invoke-Arm -Path "/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?api-version=$script:ArmApiVersion&`$filter=asTarget()"
+    $activeSet = @{}
+    $activeResp.value | Where-Object { $_.properties.status -eq "Provisioned" } |
+        ForEach-Object { $activeSet["$($_.properties.scope)|$($_.properties.roleDefinitionId)"] = $true }
+
+    $results = @()
+    foreach ($item in $eligible) {
+        $p = $item.properties
+        $roleName = $p.expandedProperties.roleDefinition.displayName
+        if ($activeSet.ContainsKey("$($p.scope)|$($p.roleDefinitionId)")) {
+            $results += @{ ok = $true; alreadyActive = $true; scope = $p.scope; role = $roleName }
+            continue
+        }
+        $requestName = [guid]::NewGuid().ToString()
+        try {
+            Invoke-Arm -Method PUT -Path "$($p.scope)/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/$requestName`?api-version=$script:ArmApiVersion" -Body @{
+                properties = @{
+                    principalId      = $script:MyPrincipalId
+                    roleDefinitionId = $p.roleDefinitionId
+                    requestType      = "SelfActivate"
+                    linkedRoleEligibilityScheduleId = $p.roleEligibilityScheduleId
+                    justification    = $Justification
+                    scheduleInfo = @{
+                        startDateTime = (Get-Date).ToUniversalTime().ToString("o")
+                        expiration    = @{ type = "AfterDuration"; duration = "PT${DurationHours}H" }
+                    }
+                }
+            } | Out-Null
+            $results += @{ ok = $true; scope = $p.scope; role = $roleName }
+        } catch {
+            $msg = Get-ArmErrorMessage $_
+            if ($msg -like "*RoleAssignmentExists*" -or $msg -like "*already exists*") {
+                $results += @{ ok = $true; alreadyActive = $true; scope = $p.scope; role = $roleName }
+            } else {
+                $results += @{ ok = $false; scope = $p.scope; role = $roleName; error = $msg }
+            }
+        }
+    }
+    return @($results)
+}
+
+# ---------- Headless modes (no web server) ----------
+if ($RunPreset) {
+    function Write-AutoLog { param([string]$Message) "$(Get-Date -Format u) $Message" | Add-Content -Path $script:AutoLogPath }
+    try {
+        $script:RefreshToken = Load-Session
+        if (-not $script:RefreshToken) {
+            Write-AutoLog "FAILED preset '$RunPreset': no saved session. Open the app and click 'Save sign-in for scheduling' first."
+            exit 1
+        }
+        $preset = Get-Presets | Where-Object { $_.name -eq $RunPreset }
+        if (-not $preset) {
+            Write-AutoLog "FAILED preset '$RunPreset': no such preset."
+            exit 1
+        }
+        $results = Invoke-PresetActivation -Preset $preset
+        $summary = ($results | ForEach-Object {
+            $outcome = if ($_.ok) { if ($_.alreadyActive) { "already active" } else { "activated" } } else { "FAILED: $($_.error)" }
+            "$($_.role)@$(($_.scope -split '/')[-1])=$outcome"
+        }) -join "; "
+        Write-AutoLog "Preset '$RunPreset' ($($results.Count) role(s)): $summary"
+    } catch {
+        Write-AutoLog "FAILED preset '$RunPreset': $($_.Exception.Message)"
+        exit 1
+    }
+    exit 0
+}
+
+function Install-PresetSchedule {
+    # Uses the ScheduledTasks module's cmdlets (proper argument arrays) rather
+    # than building a schtasks.exe command line by hand - manually quoting a
+    # program path AND its own quoted arguments inside /TR's one string is
+    # fragile and, worse, schtasks can silently hang waiting on stdin instead
+    # of erroring when something in that quoting goes wrong.
+    param([string]$PresetName, [string]$Time)
+    $taskName = "BulkPimActivator-$PresetName"
+    $argList = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$script:ScriptPath`" -RunPreset `"$PresetName`""
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argList
+    $trigger = New-ScheduledTaskTrigger -Daily -At $Time
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Force -ErrorAction Stop | Out-Null
+    return $taskName
+}
+
+if ($InstallSchedule) {
+    Write-Host "Registering scheduled task for preset '$InstallSchedule' to run daily at $ScheduleTime..." -ForegroundColor Cyan
+    try {
+        $taskName = Install-PresetSchedule -PresetName $InstallSchedule -Time $ScheduleTime
+        Write-Host "Done: task '$taskName' created." -ForegroundColor Green
+        exit 0
+    } catch {
+        Write-Host "Failed: $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
 }
 
 # ---------- HTML shell ----------
@@ -171,6 +348,10 @@ $IndexHtml = @'
     display: none; align-items: center; gap: 7px; border: 1px solid var(--border);
   }
   .topbar .account .dot { width: 8px; height: 8px; border-radius: 50%; background: #16a34a; }
+  .topbar .saved-chip {
+    font-size: 11.5px; color: var(--text-secondary); background: var(--bg); border: 1px solid var(--border);
+    padding: 4px 10px; border-radius: 999px; display: none; align-items: center; gap: 5px; margin-left: 4px;
+  }
   main { max-width: 1160px; margin: 0 auto; padding: 28px 20px 60px; }
   .page-title { font-size: 22px; font-weight: 700; margin: 4px 0 20px; display: flex; align-items: baseline; gap: 12px; }
   .page-title .subtitle { font-size: 13px; font-weight: 400; color: var(--text-secondary); }
@@ -181,8 +362,10 @@ $IndexHtml = @'
   }
   .panel h2 {
     font-size: 12.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px;
-    color: var(--text-secondary); margin: 0 0 14px;
+    color: var(--text-secondary); margin: 0 0 14px; display: flex; align-items: center; gap: 8px;
   }
+  .panel h2 .dot-accent { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+  .panel-desc { font-size: 12.5px; color: var(--text-secondary); margin: -8px 0 14px; }
   .status-banner {
     padding: 10px 14px; border-radius: 8px; background: var(--warn-bg); color: var(--warn-fg);
     font-size: 13px; margin-bottom: 12px;
@@ -191,16 +374,19 @@ $IndexHtml = @'
   .btn {
     cursor: pointer; border: 1px solid var(--border); border-radius: 8px; padding: 0 18px; height: 36px;
     font-size: 13.5px; font-family: inherit; font-weight: 600; display: inline-flex; align-items: center; gap: 6px;
+    transition: box-shadow .12s ease, background .12s ease;
   }
+  .btn:hover:not(:disabled) { box-shadow: 0 1px 4px rgba(0,0,0,.08); }
   .btn:disabled { opacity: .5; cursor: not-allowed; }
   .btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
   .btn-primary:hover:not(:disabled) { background: var(--accent-dark); border-color: var(--accent-dark); }
   .btn-secondary { background: var(--panel); color: var(--text); }
   .btn-secondary:hover:not(:disabled) { background: var(--bg); }
+  .btn-sm { height: 28px; padding: 0 12px; font-size: 12px; border-radius: 6px; }
   .field-row { display: none; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
   .field-row:last-child { margin-bottom: 0; }
   .field-row label { font-size: 13px; color: var(--text-secondary); min-width: 90px; }
-  select, input[type=text], input[type=number] {
+  select, input[type=text], input[type=number], input[type=time] {
     padding: 7px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 13.5px;
     font-family: inherit; background: var(--panel); color: var(--text); height: 34px;
   }
@@ -244,6 +430,8 @@ $IndexHtml = @'
   .badge.fail { background: var(--danger-bg); color: var(--danger-fg); cursor: help; }
   .badge.active { background: var(--info-bg); color: var(--info-fg); }
   .badge.busy { background: var(--warn-bg); color: var(--warn-fg); }
+  .badge.expiring { background: var(--warn-bg); color: var(--warn-fg); }
+  .badge.expiring-soon { background: var(--danger-bg); color: var(--danger-fg); }
   .spinner {
     width: 11px; height: 11px; border: 2px solid rgba(146,64,14,.25); border-top-color: var(--warn-fg);
     border-radius: 50%; display: inline-block; animation: spin .7s linear infinite;
@@ -251,6 +439,14 @@ $IndexHtml = @'
   @keyframes spin { to { transform: rotate(360deg); } }
   .statusbar { padding: 12px 22px; font-size: 12.5px; color: var(--text-secondary); border-top: 1px solid var(--border); }
   .empty-state { padding: 30px 20px; text-align: center; color: var(--text-secondary); font-size: 13.5px; }
+  .preset-row {
+    display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .preset-row:last-child { border-bottom: none; }
+  .preset-name { font-weight: 600; min-width: 170px; }
+  .preset-meta { color: var(--text-secondary); font-size: 12.5px; flex: 1; min-width: 140px; }
+  .preset-empty { color: var(--text-secondary); font-size: 13px; padding: 6px 0 14px; }
 </style>
 </head>
 <body>
@@ -259,6 +455,7 @@ $IndexHtml = @'
   <span class="brand-icon">&#9889;</span>
   <span class="brand">Bulk PIM Activator <span style="opacity:.6; font-weight:400; font-size:12.5px;">(Resources Only)</span></span>
   <span class="spacer"></span>
+  <span class="saved-chip" id="savedChip">&#128190; Saved for scheduling</span>
   <span class="account" id="topAccount"><span class="dot"></span><span id="topAccountLabel"></span></span>
 </div>
 
@@ -268,10 +465,25 @@ $IndexHtml = @'
   <section class="panel">
     <div id="status" class="status-banner">Checking sign-in status...</div>
     <button class="btn btn-primary" id="loginBtn">Sign in</button>
+    <button class="btn btn-secondary" id="saveSessionBtn" style="display:none">Save sign-in for scheduling</button>
   </section>
 
   <section class="panel">
-    <h2>Scope</h2>
+    <h2><span class="dot-accent"></span>Presets</h2>
+    <div class="panel-desc">Save a tenant + subscription + name filter once, then run it or schedule it daily.</div>
+    <div id="presetList"></div>
+    <div id="presetEmpty" class="preset-empty" style="display:none">No presets saved yet - pick a scope below, then save it here.</div>
+    <div class="field-row" style="display:flex">
+      <label>Preset name</label>
+      <input type="text" id="presetName" placeholder="e.g. KFAS API-Portal" style="min-width:200px">
+      <label style="min-width:auto">Filter</label>
+      <input type="text" id="presetFilter" placeholder="e.g. api-portal (blank = all)" style="width:220px">
+      <button class="btn btn-secondary" id="savePresetBtn">Save current scope as preset</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2><span class="dot-accent"></span>Scope</h2>
     <div class="field-row" id="tenantBar">
       <label>Directory</label>
       <select id="tenantSelect"></select>
@@ -285,7 +497,7 @@ $IndexHtml = @'
   </section>
 
   <section class="panel" id="controls" style="display:none">
-    <h2>Activation settings</h2>
+    <h2><span class="dot-accent"></span>Activation settings</h2>
     <div class="field-row" style="display:flex">
       <label>Reason</label>
       <input type="text" id="justification" value="Routine daily access activation" style="min-width:340px">
@@ -329,14 +541,26 @@ $IndexHtml = @'
 
 <script>
 let roles = [];
+let currentTenantId = null;
 const busy = () => document.querySelectorAll('.badge.busy').length > 0;
 
 function setRowStatus(i, html) {
   const el = document.getElementById('st-' + i);
   if (el) el.innerHTML = html;
 }
+function minutesUntil(iso) {
+  return Math.round((new Date(iso) - Date.now()) / 60000);
+}
 function badgeFor(role) {
-  return role.alreadyActive ? '<span class="badge active">Already active</span>' : '';
+  if (!role.alreadyActive) return '';
+  if (role.activeEndTime) {
+    const mins = minutesUntil(role.activeEndTime);
+    if (mins > 0 && mins <= 60) {
+      const cls = mins <= 15 ? 'expiring-soon' : 'expiring';
+      return `<span class="badge ${cls}" title="Expires at ${role.activeEndTime}">Expires in ${mins}m</span>`;
+    }
+  }
+  return '<span class="badge active">Already active</span>';
 }
 
 // ---- PKCE OAuth helpers (runs in-page so the sign-in tab we open can close itself) ----
@@ -412,10 +636,13 @@ async function refreshStatus() {
   const r = await fetch('/api/status').then(r => r.json());
   const el = document.getElementById('status');
   const topAccount = document.getElementById('topAccount');
+  currentTenantId = r.tenantId;
+  document.getElementById('savedChip').style.display = r.sessionSaved ? 'inline-flex' : 'none';
   if (r.connected) {
     el.textContent = 'Signed in as ' + r.account;
     el.classList.add('ok');
     document.getElementById('loginBtn').textContent = 'Re-sign in';
+    document.getElementById('saveSessionBtn').style.display = 'inline-flex';
     document.getElementById('tenantBar').style.display = 'flex';
     topAccount.style.display = 'inline-flex';
     document.getElementById('topAccountLabel').textContent = r.account;
@@ -423,6 +650,7 @@ async function refreshStatus() {
   } else {
     el.textContent = 'Not signed in';
     el.classList.remove('ok');
+    document.getElementById('saveSessionBtn').style.display = 'none';
     document.getElementById('tenantBar').style.display = 'none';
     document.getElementById('subBar').style.display = 'none';
     document.getElementById('controls').style.display = 'none';
@@ -478,6 +706,89 @@ async function loadRoles() {
   document.getElementById('roleTable').style.display = roles.length ? 'table' : 'none';
   document.getElementById('log').textContent = roles.length ? `${roles.length} eligible role(s) found.` : 'No eligible roles found.';
 }
+
+// ---- Presets ----
+async function loadPresets() {
+  const r = await fetch('/api/presets').then(r => r.json());
+  const list = document.getElementById('presetList');
+  const presets = r.presets || [];
+  list.innerHTML = '';
+  document.getElementById('presetEmpty').style.display = presets.length ? 'none' : 'block';
+  presets.forEach(p => {
+    const row = document.createElement('div');
+    row.className = 'preset-row';
+    row.innerHTML = `
+      <div class="preset-name">${p.name}</div>
+      <div class="preset-meta">${p.filter ? 'filter: "' + p.filter + '"' : 'all eligible roles'} &middot; sub ${p.subscriptionId.slice(0,8)}...</div>
+      <button class="btn btn-secondary btn-sm" data-run="${p.name}">Run now</button>
+      <input type="time" class="sched-time" value="08:00">
+      <button class="btn btn-secondary btn-sm" data-sched="${p.name}">Schedule daily</button>
+      <button class="btn btn-secondary btn-sm" data-del="${p.name}">Delete</button>
+    `;
+    list.appendChild(row);
+  });
+  list.querySelectorAll('[data-run]').forEach(b => b.onclick = () => runPreset(b.dataset.run));
+  list.querySelectorAll('[data-sched]').forEach(b => b.onclick = () => schedulePreset(b));
+  list.querySelectorAll('[data-del]').forEach(b => b.onclick = () => deletePreset(b.dataset.del));
+}
+
+async function runPreset(name) {
+  document.getElementById('log').textContent = 'Running preset "' + name + '"...';
+  const r = await fetch('/api/presets/run', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name })
+  }).then(r => r.json());
+  if (r.error) {
+    document.getElementById('log').textContent = 'Preset failed: ' + r.error;
+    return;
+  }
+  document.getElementById('log').textContent = (r.results || []).map(x =>
+    x.role + ': ' + (x.ok ? (x.alreadyActive ? 'already active' : 'activated') : 'FAILED - ' + x.error)
+  ).join(' | ') || 'No matching eligible roles.';
+  if (document.getElementById('subscriptionSelect').value) loadRoles();
+}
+
+async function schedulePreset(btn) {
+  const name = btn.dataset.sched;
+  const time = btn.parentElement.querySelector('.sched-time').value || '08:00';
+  const r = await fetch('/api/schedule/install', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, time })
+  }).then(r => r.json());
+  document.getElementById('log').textContent = r.ok
+    ? `Scheduled "${name}" to run daily at ${time} (Windows Task Scheduler).`
+    : 'Schedule failed: ' + r.error;
+}
+
+async function deletePreset(name) {
+  await fetch('/api/presets/delete', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name })
+  });
+  loadPresets();
+}
+
+document.getElementById('savePresetBtn').onclick = async () => {
+  const name = document.getElementById('presetName').value.trim();
+  const filter = document.getElementById('presetFilter').value.trim();
+  const tenantId = document.getElementById('tenantSelect').value || currentTenantId;
+  const subscriptionId = document.getElementById('subscriptionSelect').value;
+  if (!name) { alert('Enter a preset name.'); return; }
+  if (!tenantId || !subscriptionId) { alert('Pick a directory and subscription first.'); return; }
+  await fetch('/api/presets', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, tenantId, subscriptionId, filter })
+  });
+  document.getElementById('presetName').value = '';
+  document.getElementById('presetFilter').value = '';
+  document.getElementById('log').textContent = `Preset "${name}" saved.`;
+  loadPresets();
+};
+
+document.getElementById('saveSessionBtn').onclick = async () => {
+  const r = await fetch('/api/session/save', { method: 'POST' }).then(r => r.json());
+  document.getElementById('log').textContent = r.ok
+    ? 'Sign-in saved (encrypted) for scheduled activation - you can now use "Schedule daily" on a preset.'
+    : 'Failed to save: ' + r.error;
+  refreshStatus();
+};
 
 document.getElementById('loginBtn').onclick = async () => {
   if (await signInFlow(null, 'Opening a sign-in tab...')) refreshStatus();
@@ -549,6 +860,7 @@ document.getElementById('deactivateBtn').onclick = () =>
   runBulkAction('/api/deactivate', role => role.alreadyActive, 'deactivate');
 
 refreshStatus();
+loadPresets();
 </script>
 </body>
 </html>
@@ -605,7 +917,12 @@ try {
                 Write-HtmlResponse -Context $context -Html $IndexHtml
             }
             elseif ($path -eq "/api/status" -and $req.HttpMethod -eq "GET") {
-                Write-JsonResponse -Context $context -Object @{ connected = $script:Connected; account = $script:AccountLabel; tenantId = $script:CurrentTenantId }
+                Write-JsonResponse -Context $context -Object @{
+                    connected    = $script:Connected
+                    account      = $script:AccountLabel
+                    tenantId     = $script:CurrentTenantId
+                    sessionSaved = (Test-Path $script:SessionPath)
+                }
             }
             elseif ($path -eq "/api/oauth/exchange" -and $req.HttpMethod -eq "POST") {
                 $body = Get-RequestBody -Context $context
@@ -633,6 +950,18 @@ try {
                 } catch {
                     $msg = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
                     Write-JsonResponse -Context $context -Object @{ ok = $false; error = $msg }
+                }
+            }
+            elseif ($path -eq "/api/session/save" -and $req.HttpMethod -eq "POST") {
+                if (-not $script:RefreshToken) {
+                    Write-JsonResponse -Context $context -Object @{ ok = $false; error = "Not signed in." }
+                } else {
+                    try {
+                        Save-Session -RefreshTokenValue $script:RefreshToken
+                        Write-JsonResponse -Context $context -Object @{ ok = $true }
+                    } catch {
+                        Write-JsonResponse -Context $context -Object @{ ok = $false; error = $_.Exception.Message }
+                    }
                 }
             }
             elseif ($path -eq "/api/tenant/select" -and $req.HttpMethod -eq "POST") {
@@ -664,6 +993,52 @@ try {
                     Write-JsonResponse -Context $context -Object @{ subscriptions = @($subs) }
                 }
             }
+            elseif ($path -eq "/api/presets" -and $req.HttpMethod -eq "GET") {
+                Write-JsonResponse -Context $context -Object @{ presets = @(Get-Presets) }
+            }
+            elseif ($path -eq "/api/presets" -and $req.HttpMethod -eq "POST") {
+                $body = Get-RequestBody -Context $context
+                $presets = @(Get-Presets | Where-Object { $_.name -ne $body.name })
+                $presets += @{ name = $body.name; tenantId = $body.tenantId; subscriptionId = $body.subscriptionId; filter = $body.filter }
+                Save-Presets -Presets $presets
+                Write-JsonResponse -Context $context -Object @{ ok = $true }
+            }
+            elseif ($path -eq "/api/presets/delete" -and $req.HttpMethod -eq "POST") {
+                $body = Get-RequestBody -Context $context
+                $presets = @(Get-Presets | Where-Object { $_.name -ne $body.name })
+                Save-Presets -Presets $presets
+                Write-JsonResponse -Context $context -Object @{ ok = $true }
+            }
+            elseif ($path -eq "/api/presets/run" -and $req.HttpMethod -eq "POST") {
+                $body = Get-RequestBody -Context $context
+                $preset = Get-Presets | Where-Object { $_.name -eq $body.name }
+                if (-not $preset) {
+                    Write-JsonResponse -Context $context -Object @{ error = "Preset '$($body.name)' not found." } -StatusCode 404
+                } else {
+                    try {
+                        $justification = if ($body.justification) { $body.justification } else { "Routine daily access activation" }
+                        $durationHours = if ($body.durationHours) { $body.durationHours } else { 8 }
+                        $results = Invoke-PresetActivation -Preset $preset -Justification $justification -DurationHours $durationHours
+                        Write-JsonResponse -Context $context -Object @{ results = $results }
+                    } catch {
+                        Write-JsonResponse -Context $context -Object @{ error = (Get-ArmErrorMessage $_) } -StatusCode 500
+                    }
+                }
+            }
+            elseif ($path -eq "/api/schedule/install" -and $req.HttpMethod -eq "POST") {
+                $body = Get-RequestBody -Context $context
+                $preset = Get-Presets | Where-Object { $_.name -eq $body.name }
+                if (-not $preset) {
+                    Write-JsonResponse -Context $context -Object @{ ok = $false; error = "Preset '$($body.name)' not found." }
+                } else {
+                    try {
+                        $taskName = Install-PresetSchedule -PresetName $body.name -Time $body.time
+                        Write-JsonResponse -Context $context -Object @{ ok = $true; taskName = $taskName }
+                    } catch {
+                        Write-JsonResponse -Context $context -Object @{ ok = $false; error = $_.Exception.Message }
+                    }
+                }
+            }
             elseif ($path -eq "/api/roles" -and $req.HttpMethod -eq "GET" -and -not $script:Connected) {
                 Write-JsonResponse -Context $context -Object @{ roles = @() }
             }
@@ -682,10 +1057,11 @@ try {
                 $activeResp = Invoke-Arm -Path "/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?api-version=$script:ArmApiVersion&`$filter=asTarget()"
                 $active = @{}
                 $activeResp.value | Where-Object { $_.properties.status -eq "Provisioned" } |
-                    ForEach-Object { $active["$($_.properties.scope)|$($_.properties.roleDefinitionId)"] = $true }
+                    ForEach-Object { $active["$($_.properties.scope)|$($_.properties.roleDefinitionId)"] = $_.properties.endDateTime }
 
                 $roles = @($eligible | ForEach-Object {
                     $p = $_.properties
+                    $activeEndTime = $active["$($p.scope)|$($p.roleDefinitionId)"]
                     @{
                         role             = $p.expandedProperties.roleDefinition.displayName
                         resourceName     = ($p.scope -split "/")[-1]
@@ -693,7 +1069,8 @@ try {
                         endTime          = $p.endDateTime
                         roleDefinitionId = $p.roleDefinitionId
                         eligibilityName  = $p.roleEligibilityScheduleId
-                        alreadyActive    = [bool]$active.ContainsKey("$($p.scope)|$($p.roleDefinitionId)")
+                        alreadyActive    = [bool]$activeEndTime
+                        activeEndTime    = $activeEndTime
                     }
                 })
                 Write-JsonResponse -Context $context -Object @{ roles = $roles }

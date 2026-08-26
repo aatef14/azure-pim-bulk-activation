@@ -3,3 +3,6 @@ portal.log
 Activate-PimRoles.ps1
 activate-pim-roles.ps1
 __pycache__/
+presets.json
+session.dat
+auto-activate.log

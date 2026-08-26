@@ -185,5 +185,73 @@ def deactivate_roles(
     return resp.json()
 
 
+@server.tool()
+def list_presets() -> list[dict]:
+    """List saved presets (name, tenantId, subscriptionId, filter). A preset
+    bundles a tenant + subscription + optional resource-name filter so you
+    don't have to re-specify scope every time."""
+    _ensure_portal_running()
+    return requests.get(f"{BASE_URL}/api/presets", timeout=10).json().get("presets", [])
+
+
+@server.tool()
+def save_preset(name: str, tenant_id: str, subscription_id: str, filter: str = "") -> dict:
+    """Save (or overwrite) a preset with the given name, tenant, subscription,
+    and an optional case-insensitive substring filter on resource group name
+    (e.g. 'api-portal' to only match resource groups containing that text;
+    leave blank to match every eligible role in that subscription)."""
+    _ensure_portal_running()
+    resp = requests.post(
+        f"{BASE_URL}/api/presets",
+        json={"name": name, "tenantId": tenant_id, "subscriptionId": subscription_id, "filter": filter},
+        timeout=10,
+    )
+    return resp.json()
+
+
+@server.tool()
+def run_preset(
+    name: str,
+    justification: str = "Routine daily access activation",
+    duration_hours: int = 8,
+) -> dict:
+    """Activate every not-yet-active eligible role matching a saved preset in
+    one call (resolves tenant/subscription/filter itself - no need to call
+    select_tenant/list_roles first). Returns per-role results."""
+    _ensure_portal_running()
+    resp = requests.post(
+        f"{BASE_URL}/api/presets/run",
+        json={"name": name, "justification": justification, "durationHours": duration_hours},
+        timeout=60,
+    )
+    return resp.json()
+
+
+@server.tool()
+def schedule_preset(name: str, time: str = "08:00") -> dict:
+    """Register a Windows scheduled task that runs the named preset
+    automatically every day at the given time (HH:mm, 24h), with no browser
+    or user interaction - requires save_session_for_scheduling to have been
+    called at least once so a saved sign-in exists for it to use."""
+    _ensure_portal_running()
+    resp = requests.post(
+        f"{BASE_URL}/api/schedule/install",
+        json={"name": name, "time": time},
+        timeout=15,
+    )
+    return resp.json()
+
+
+@server.tool()
+def save_session_for_scheduling() -> dict:
+    """Encrypt and save the current sign-in (Windows DPAPI - only this
+    Windows account on this machine can decrypt it) so scheduled/headless
+    preset runs can authenticate without a browser. Requires being signed in
+    already (check get_status first)."""
+    _ensure_portal_running()
+    resp = requests.post(f"{BASE_URL}/api/session/save", timeout=10)
+    return resp.json()
+
+
 if __name__ == "__main__":
     server.run()
